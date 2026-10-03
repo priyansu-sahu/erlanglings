@@ -1,0 +1,563 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+%%! -noshell
+%%
+%% erlanglings -- the exercise runner.
+%%
+%% This file is itself a small piece of Erlang worth reading once you are a
+%% few exercises in: it uses lists, maps, binaries, pattern matching, the
+%% `compile` and `eunit` modules, and a receive loop (in `watch`).
+%%
+%% Usage:
+%%   ./erlanglings                 run the current exercise (first unfinished one)
+%%   ./erlanglings list            show every exercise and its status
+%%   ./erlanglings run <name|nn>   compile + test one exercise
+%%   ./erlanglings hint [name|nn]  print the hints for an exercise
+%%   ./erlanglings solution <name> print the reference solution
+%%   ./erlanglings reset <name>    restore an exercise to its starting state (git checkout)
+%%   ./erlanglings watch           rerun the current exercise whenever a file changes
+%%   ./erlanglings verify          maintainers/CI: every solution passes, every starter fails
+%%
+%% Windows (cmd / PowerShell): `erlanglings <command>` via erlanglings.cmd.
+
+-mode(compile).
+
+-define(MARKER, <<"I AM NOT DONE">>).
+-define(EXERCISES_DIR, "exercises").
+-define(SOLUTIONS_DIR, "solutions").
+-define(BUILD_DIR, "_build").
+
+main(Args) ->
+    Root = root_dir(),
+    ok = file:set_cwd(Root),
+    try dispatch(Args) of
+        ok -> halt(0);
+        {exit, Code} -> halt(Code)
+    catch
+        throw:{usage_error, Msg} ->
+            io:format("error: ~s~n~n", [Msg]),
+            usage(),
+            halt(2)
+    end.
+
+dispatch([]) -> cmd_run(current);
+dispatch(["run"]) -> cmd_run(current);
+dispatch(["run", Name]) -> cmd_run(Name);
+dispatch(["list"]) -> cmd_list();
+dispatch(["ls"]) -> cmd_list();
+dispatch(["hint"]) -> cmd_hint(current);
+dispatch(["hint", Name]) -> cmd_hint(Name);
+dispatch(["solution", Name]) -> cmd_solution(Name);
+dispatch(["reset", Name]) -> cmd_reset(Name);
+dispatch(["watch"]) -> cmd_watch();
+dispatch(["verify"]) -> cmd_verify();
+dispatch(["verify", Name]) -> cmd_verify_one(Name);
+dispatch([H | _]) when H =:= "help"; H =:= "--help"; H =:= "-h" -> usage(), ok;
+dispatch(Other) -> throw({usage_error, io_lib:format("unknown arguments ~p", [Other])}).
+
+usage() ->
+    io:format(
+      "erlanglings - small exercises to get you reading and writing Erlang~n"
+      "~n"
+      "  erlanglings                  run the current exercise (first unfinished)~n"
+      "  erlanglings list             show all exercises and their status~n"
+      "  erlanglings run <name|nn>    compile and test one exercise~n"
+      "  erlanglings hint [name|nn]   print the hints for an exercise~n"
+      "  erlanglings solution <name>  print the reference solution~n"
+      "  erlanglings reset <name>     restore an exercise to its starting state~n"
+      "  erlanglings watch            rerun the current exercise when files change~n"
+      "  erlanglings verify [name]    check that solutions pass and starters fail~n"
+      "~n"
+      "An exercise counts as done when none of its .erl/.hrl files contain the line~n"
+      "  %% I AM NOT DONE~n"
+      "Fix the code, make the tests pass, then delete that line to move on.~n").
+
+%%%===================================================================
+%%% Commands
+%%%===================================================================
+
+cmd_list() ->
+    Exercises = exercises(),
+    Current = current_exercise(Exercises),
+    io:format("~n  ~-6s ~-36s ~s~n", ["", "exercise", "status"]),
+    io:format("  ~s~n", [lists:duplicate(60, $-)]),
+    lists:foreach(
+      fun(Ex) ->
+              Status = case {is_done(Ex), Ex =:= Current} of
+                           {true, _} -> "done";
+                           {false, true} -> "<-- current";
+                           {false, false} -> ""
+                       end,
+              Mark = case is_done(Ex) of true -> "[ok]"; false -> "[  ]" end,
+              io:format("  ~-6s ~-36s ~s~n", [Mark, Ex, Status])
+      end, Exercises),
+    Done = length([E || E <- Exercises, is_done(E)]),
+    io:format("~n  ~b / ~b done~n~n", [Done, length(Exercises)]),
+    ok.
+
+cmd_run(Which) ->
+    Ex = resolve(Which),
+    case run_exercise(Ex, true) of
+        {ok, done} ->
+            io:format("~n  [ok] ~s is complete!~n", [Ex]),
+            case next_exercise(Ex) of
+                none -> io:format("~n  That was the last exercise. You made it through all of erlanglings!~n~n");
+                Next -> io:format("       Next up: ~s~n       Run `erlanglings` again to continue.~n~n", [Next])
+            end,
+            ok;
+        {ok, marker_present} ->
+            io:format("~n  [ok] All tests pass for ~s!~n~n"
+                      "       When you're sure you understand WHY they pass, remove the line~n"
+                      "         %% I AM NOT DONE~n"
+                      "       from:~n", [Ex]),
+            [io:format("         ~s~n", [F]) || F <- marker_files(exercise_dir(Ex))],
+            io:format("       and run again to move on.~n~n"),
+            {exit, 1};
+        {error, compile} ->
+            io:format("~n  [x] ~s did not compile.~n~n"
+                      "      Read the FIRST error above: it tells you file:line and what the compiler~n"
+                      "      saw. Later errors are often just consequences of the first one.~n"
+                      "      Stuck? `erlanglings hint ~s`~n~n", [Ex, Ex]),
+            {exit, 1};
+        {error, tests} ->
+            io:format("~n  [x] Tests failed for ~s.~n~n"
+                      "      Look for `expected` and `value` in the output above (eunit shows what~n"
+                      "      the test wanted vs what your code returned), or `?TODO` placeholders~n"
+                      "      you have not replaced yet.~n"
+                      "      Stuck? `erlanglings hint ~s`~n~n", [Ex, Ex]),
+            {exit, 1}
+    end.
+
+cmd_hint(Which) ->
+    Ex = resolve(Which),
+    Readme = filename:join(exercise_dir(Ex), "README.md"),
+    case file:read_file(Readme) of
+        {ok, Bin} ->
+            case hints_section(Bin) of
+                [] -> io:format("~nNo hints section found in ~s~n~n", [Readme]);
+                Lines ->
+                    io:format("~nHints for ~s~n~s~n", [Ex, lists:duplicate(50, $-)]),
+                    [io:format("~s~n", [L]) || L <- Lines],
+                    io:format("~n")
+            end,
+            ok;
+        {error, Reason} ->
+            io:format("Could not read ~s: ~p~n", [Readme, Reason]),
+            {exit, 1}
+    end.
+
+cmd_solution(Which) ->
+    Ex = resolve(Which),
+    Dir = filename:join(?SOLUTIONS_DIR, Ex),
+    case solution_files(Ex) of
+        [] ->
+            io:format("No solution found under ~s~n", [Dir]),
+            {exit, 1};
+        Files ->
+            lists:foreach(
+              fun(F) ->
+                      {ok, Bin} = file:read_file(F),
+                      io:format("~n==== ~s ====~n~s~n", [F, Bin])
+              end, Files),
+            ok
+    end.
+
+cmd_reset(Which) ->
+    Ex = resolve(Which),
+    Dir = exercise_dir(Ex),
+    Cmd = "git checkout -- " ++ quote(Dir),
+    Out = os:cmd(Cmd),
+    io:format("~s", [Out]),
+    rm_rf(filename:join(?BUILD_DIR, Ex)),
+    io:format("Reset ~s to its starting state.~n", [Ex]),
+    ok.
+
+cmd_watch() ->
+    io:format("Watching for changes. Press Ctrl+C to stop.~n"),
+    watch_loop(undefined).
+
+watch_loop(LastSnapshot) ->
+    Exercises = exercises(),
+    case current_exercise(Exercises) of
+        none ->
+            io:format("~nAll exercises complete. Nothing left to watch!~n"),
+            ok;
+        Ex ->
+            Dir = exercise_dir(Ex),
+            Snapshot = snapshot(Dir),
+            case Snapshot =:= LastSnapshot of
+                true ->
+                    timer:sleep(500),
+                    watch_loop(LastSnapshot);
+                false ->
+                    io:format("~n~s~n", [lists:duplicate(70, $=)]),
+                    _ = run_exercise(Ex, true),
+                    case is_done(Ex) of
+                        true ->
+                            io:format("~n  [ok] ~s complete. Moving on to the next one...~n", [Ex]),
+                            watch_loop(undefined);
+                        false ->
+                            io:format("~n  (watching ~s -- save a file to rerun)~n", [Dir]),
+                            watch_loop(Snapshot)
+                    end
+            end
+    end.
+
+cmd_verify() ->
+    Exercises = exercises(),
+    Results = [verify_exercise(Ex) || Ex <- Exercises],
+    io:format("~n~-36s ~-14s ~s~n", ["exercise", "starter", "solution"]),
+    io:format("~s~n", [lists:duplicate(66, $-)]),
+    lists:foreach(
+      fun({Ex, Starter, Solution}) ->
+              io:format("~-36s ~-14s ~s~n", [Ex, fmt_verify(Starter), fmt_verify(Solution)])
+      end, Results),
+    Failures = [Ex || {Ex, S, Sol} <- Results, S =/= ok orelse Sol =/= ok],
+    case Failures of
+        [] ->
+            io:format("~nAll ~b exercises verified.~n", [length(Exercises)]),
+            ok;
+        _ ->
+            io:format("~n~b exercise(s) failed verification: ~s~n",
+                      [length(Failures), lists:join(", ", Failures)]),
+            {exit, 1}
+    end.
+
+cmd_verify_one(Which) ->
+    Ex = resolve(Which),
+    {Ex, Starter, Solution} = verify_exercise(Ex),
+    io:format("~n~s~n  starter:  ~s~n  solution: ~s~n", [Ex, fmt_verify(Starter), fmt_verify(Solution)]),
+    case Starter =:= ok andalso Solution =:= ok of
+        true -> ok;
+        false -> {exit, 1}
+    end.
+
+solution_files(Ex) ->
+    [F || F <- filelib:wildcard(filename:join([?SOLUTIONS_DIR, Ex, "*"])), filelib:is_regular(F)].
+
+fmt_verify(ok) -> "ok";
+fmt_verify({failed, Why}) -> "FAILED (" ++ Why ++ ")".
+
+%% A starter is good when it does NOT pass as-is (so there is work to do) and
+%% carries the marker. A solution is good when, overlaid on the exercise, it
+%% compiles, passes, and no longer carries the marker.
+verify_exercise(Ex) ->
+    Dir = exercise_dir(Ex),
+    StarterResult =
+        case marker_files(Dir) of
+            [] -> {failed, "no I AM NOT DONE marker"};
+            _ ->
+                case run_exercise(Ex, false) of
+                    {ok, _} -> {failed, "starter already passes"};
+                    {error, _} -> ok
+                end
+        end,
+    SolutionResult =
+        case solution_files(Ex) of
+            [] -> {failed, "no solution files"};
+            SolFiles ->
+                case lists:any(fun has_marker/1, SolFiles) of
+                    true -> {failed, "solution still has marker"};
+                    false -> verify_solution(Ex, Dir, SolFiles)
+                end
+        end,
+    {Ex, StarterResult, SolutionResult}.
+
+verify_solution(Ex, Dir, SolFiles) ->
+    Tmp = filename:join([?BUILD_DIR, "verify", Ex, "src"]),
+    rm_rf(filename:join([?BUILD_DIR, "verify", Ex])),
+    ok = filelib:ensure_dir(filename:join(Tmp, "x")),
+    %% copy every exercise file (sources, headers, data), then overlay solutions
+    lists:foreach(
+      fun(F) -> {ok, _} = file:copy(F, filename:join(Tmp, filename:basename(F))) end,
+      [F || F <- filelib:wildcard(filename:join(Dir, "*")), filelib:is_regular(F)]),
+    lists:foreach(
+      fun(F) -> {ok, _} = file:copy(F, filename:join(Tmp, filename:basename(F))) end,
+      SolFiles),
+    OutDir = filename:join([?BUILD_DIR, "verify", Ex, "ebin"]),
+    case compile_and_test(Tmp, OutDir, false) of
+        {ok, _} -> ok;
+        {error, compile} -> {failed, "solution does not compile"};
+        {error, tests} -> {failed, "solution fails tests"}
+    end.
+
+%%%===================================================================
+%%% Running an exercise
+%%%===================================================================
+
+%% Returns {ok, done} | {ok, marker_present} | {error, compile} | {error, tests}
+run_exercise(Ex, Verbose) ->
+    Dir = exercise_dir(Ex),
+    OutDir = filename:join(?BUILD_DIR, Ex),
+    Verbose andalso io:format("~n  Running ~s~n~n", [Ex]),
+    case compile_and_test(Dir, OutDir, Verbose) of
+        {ok, _} ->
+            case marker_files(Dir) of
+                [] -> {ok, done};
+                _ -> {ok, marker_present}
+            end;
+        Error -> Error
+    end.
+
+compile_and_test(SrcDir, OutDir, Verbose) ->
+    ok = filelib:ensure_dir(filename:join(OutDir, "x")),
+    Sources = lists:sort(filelib:wildcard(filename:join(SrcDir, "*.erl"))),
+    %% Compile non-test modules first so include files and parse transforms
+    %% resolve naturally; tests last.
+    {Tests, Mods} = lists:partition(fun is_test_file/1, Sources),
+    Ordered = Mods ++ Tests,
+    AbsSrcDir = filename:absname(SrcDir),
+    %% Errors are printed by the compiler itself (its output is part of what the
+    %% learner should get used to reading). Warnings come back to us so we can
+    %% drop the noise that every unfinished ?TODO produces.
+    Opts = [return_warnings, debug_info, {outdir, OutDir}, {i, AbsSrcDir}, {i, SrcDir}]
+           ++ [report_errors || Verbose],
+    case compile_all(Ordered, Opts) of
+        {error, _} -> {error, compile};
+        {ok, Loaded, Warnings} ->
+            Verbose andalso print_warnings(Warnings),
+            true = code:add_patha(filename:absname(OutDir)),
+            lists:foreach(fun load_module/1, Loaded),
+            TestMods = [list_to_atom(filename:basename(T, ".erl")) || T <- Tests],
+            case run_eunit(TestMods, Verbose) of
+                ok -> {ok, Loaded};
+                error -> {error, tests}
+            end
+    end.
+
+compile_all(Files, Opts) -> compile_all(Files, Opts, [], []).
+
+compile_all([], _Opts, Mods, Warnings) -> {ok, lists:reverse(Mods), lists:append(lists:reverse(Warnings))};
+compile_all([File | Rest], Opts, Mods, Warnings) ->
+    AbsFile = filename:absname(File),
+    case compile:file(AbsFile, Opts) of
+        {ok, Mod, W} -> compile_all(Rest, Opts, [Mod | Mods], [W | Warnings]);
+        {ok, Mod} -> compile_all(Rest, Opts, [Mod | Mods], Warnings);
+        {error, _Errors, _Warnings} -> {error, File};
+        error -> {error, File}
+    end.
+
+%% Warnings arrive as [{File, [{Location, Module, Description}]}].
+%% We hide "this clause cannot match" warnings on lines that still hold a
+%% ?TODO placeholder (the learner knows those are unfinished) and show the
+%% rest in the compiler's usual file:line: format.
+print_warnings(Warnings) ->
+    Shown = [{File, Loc, Mod, Desc}
+             || {File, Ws} <- Warnings, {Loc, Mod, Desc} <- Ws,
+                not todo_noise(File, Loc, Mod, Desc)],
+    Hidden = length([x || {_, Ws} <- Warnings, _ <- Ws]) - length(Shown),
+    lists:foreach(
+      fun({File, Loc, Mod, Desc}) ->
+              io:format("~s:~s: Warning: ~s~n", [File, fmt_loc(Loc), Mod:format_error(Desc)])
+      end, Shown),
+    Shown =/= [] andalso io:format("~n"),
+    Hidden > 0 andalso
+        io:format("  (~b warning(s) about unfinished ?TODO placeholders hidden)~n~n", [Hidden]),
+    ok.
+
+todo_noise(File, Loc, Mod, Desc) ->
+    Msg = lists:flatten(Mod:format_error(Desc)),
+    case string:find(Msg, "cannot match") of
+        nomatch -> false;
+        _ -> line_has_todo(File, Loc)
+    end.
+
+line_has_todo(File, Loc) ->
+    Line = case Loc of {L, _C} -> L; L when is_integer(L) -> L; _ -> 0 end,
+    case file:read_file(File) of
+        {ok, Bin} ->
+            Lines = binary:split(Bin, [<<"
+">>, <<"
+">>], [global]),
+            case Line >= 1 andalso Line =< length(Lines) of
+                true -> binary:match(lists:nth(Line, Lines), <<"?TODO">>) =/= nomatch;
+                false -> false
+            end;
+        _ -> false
+    end.
+
+fmt_loc({L, C}) -> io_lib:format("~b:~b", [L, C]);
+fmt_loc(L) when is_integer(L) -> integer_to_list(L);
+fmt_loc(_) -> "?".
+
+load_module(Mod) ->
+    _ = code:purge(Mod),
+    _ = code:delete(Mod),
+    _ = code:purge(Mod),
+    case code:load_file(Mod) of
+        {module, Mod} -> ok;
+        {error, Reason} -> erlang:error({cannot_load, Mod, Reason})
+    end.
+
+run_eunit([], _Verbose) -> ok;
+run_eunit(TestMods, true) ->
+    do_run_eunit(TestMods, [verbose]);
+run_eunit(TestMods, false) ->
+    %% `verify` runs starters that are expected to fail; their eunit report
+    %% is noise, so run with the output redirected to a sink process.
+    quietly(fun() -> do_run_eunit(TestMods, []) end).
+
+do_run_eunit(TestMods, Opts) ->
+    try eunit:test([{module, M} || M <- TestMods], Opts) of
+        ok -> ok;
+        error -> error;
+        {error, _} -> error
+    catch
+        Class:Reason ->
+            io:format("eunit crashed: ~p:~p~n", [Class, Reason]),
+            error
+    end.
+
+%% Run Fun with this process's group leader (where io:format output goes)
+%% swapped for a process that answers every io request and drops the text.
+quietly(Fun) ->
+    Old = group_leader(),
+    Sink = spawn(fun io_sink/0),
+    group_leader(Sink, self()),
+    %% Crashing test processes also produce logger ERROR REPORTs; mute those.
+    #{level := OldLevel} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, none),
+    try Fun()
+    after
+        ok = logger:set_primary_config(level, OldLevel),
+        group_leader(Old, self()),
+        exit(Sink, kill)
+    end.
+
+io_sink() ->
+    receive
+        {io_request, From, ReplyAs, {get_geometry, _}} ->
+            From ! {io_reply, ReplyAs, {error, enotsup}}, io_sink();
+        {io_request, From, ReplyAs, _Request} ->
+            From ! {io_reply, ReplyAs, ok}, io_sink();
+        _ -> io_sink()
+    end.
+
+is_test_file(File) ->
+    lists:suffix("_tests.erl", filename:basename(File)).
+
+%%%===================================================================
+%%% Exercise discovery
+%%%===================================================================
+
+exercises() ->
+    Dirs = [D || D <- filelib:wildcard(filename:join(?EXERCISES_DIR, "*")), filelib:is_dir(D)],
+    lists:sort([filename:basename(D) || D <- Dirs]).
+
+exercise_dir(Ex) -> filename:join(?EXERCISES_DIR, Ex).
+
+current_exercise(Exercises) ->
+    case [E || E <- Exercises, not is_done(E)] of
+        [] -> none;
+        [First | _] -> First
+    end.
+
+next_exercise(Ex) ->
+    Exercises = exercises(),
+    case lists:dropwhile(fun(E) -> E =/= Ex end, Exercises) of
+        [_, Next | _] -> Next;
+        _ -> none
+    end.
+
+is_done(Ex) -> marker_files(exercise_dir(Ex)) =:= [].
+
+%% Learner-edited files are .erl sources and, occasionally, .hrl headers.
+marker_files(Dir) ->
+    [F || F <- source_files(Dir), has_marker(F)].
+
+source_files(Dir) ->
+    lists:sort(filelib:wildcard(filename:join(Dir, "*.erl"))
+               ++ filelib:wildcard(filename:join(Dir, "*.hrl"))).
+
+has_marker(File) ->
+    case file:read_file(File) of
+        {ok, Bin} -> binary:match(Bin, ?MARKER) =/= nomatch;
+        _ -> false
+    end.
+
+%% Accepts: current | "05" | "5" | "05_tagged_tuples" | "tagged_tuples" | a unique prefix
+resolve(current) ->
+    case current_exercise(exercises()) of
+        none ->
+            io:format("All exercises are complete! Run `erlanglings list` to see them,~n"
+                      "or `erlanglings reset <name>` to redo one.~n"),
+            halt(0);
+        Ex -> Ex
+    end;
+resolve(Name) ->
+    Exercises = exercises(),
+    Padded = try list_to_integer(Name) of
+                 N -> lists:flatten(io_lib:format("~2..0b", [N]))
+             catch
+                 error:badarg -> Name
+             end,
+    Matches = [E || E <- Exercises,
+                    E =:= Name
+                        orelse lists:prefix(Padded ++ "_", E)
+                        orelse lists:suffix("_" ++ Name, E)],
+    case Matches of
+        [One] -> One;
+        [] ->
+            Prefix = [E || E <- Exercises, lists:prefix(Name, E)],
+            case Prefix of
+                [One] -> One;
+                _ -> throw({usage_error, "no exercise matches '" ++ Name ++ "' (try `erlanglings list`)"})
+            end;
+        Many -> throw({usage_error, io_lib:format("ambiguous name '~s': ~p", [Name, Many])})
+    end.
+
+%%%===================================================================
+%%% Helpers
+%%%===================================================================
+
+root_dir() ->
+    filename:dirname(filename:absname(escript:script_name())).
+
+snapshot(Dir) ->
+    [{F, filelib:last_modified(F), filelib:file_size(F)}
+     || F <- lists:sort(filelib:wildcard(filename:join(Dir, "*")))].
+
+%% Extract the lines of the "## Hints" section from a README, dropping the
+%% <details>/<summary> wrapper tags.
+hints_section(Bin) ->
+    Lines = binary:split(Bin, [<<"\r\n">>, <<"\n">>], [global]),
+    AfterHeading = lists:dropwhile(fun(L) -> not is_hints_heading(L) end, Lines),
+    Body = case AfterHeading of
+               [] -> [];
+               [_Heading | Rest] -> lists:takewhile(fun(L) -> not is_heading(L) end, Rest)
+           end,
+    [L || L <- Body, not is_html_wrapper(L)].
+
+is_hints_heading(L) ->
+    case string:lowercase(string:trim(L)) of
+        <<"## hint", _/binary>> -> true;
+        _ -> false
+    end.
+
+is_heading(L) -> binary:match(L, <<"## ">>) =:= {0, 3}.
+
+%% Lines like <details>, </details>, <details><summary>Hints</summary> are
+%% GitHub folding markup; drop them in terminal output.
+is_html_wrapper(L) ->
+    T = string:trim(L),
+    case T of
+        <<"<details", _/binary>> -> true;
+        <<"</details", _/binary>> -> true;
+        <<"<summary", _/binary>> -> true;
+        _ -> false
+    end.
+
+quote(S) -> "\"" ++ S ++ "\"".
+
+rm_rf(Path) ->
+    case filelib:is_dir(Path) of
+        true ->
+            {ok, Entries} = file:list_dir(Path),
+            [rm_rf(filename:join(Path, E)) || E <- Entries],
+            ok = file:del_dir(Path);
+        false ->
+            case filelib:is_regular(Path) of
+                true -> ok = file:delete(Path);
+                false -> ok
+            end
+    end.

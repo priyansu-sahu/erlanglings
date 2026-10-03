@@ -1,0 +1,10 @@
+{
+  "name": "erlanglings",
+  "image": "erlang:27",
+  "customizations": {
+    "vscode": {
+      "extensions": ["erlang-ls.erlang-ls"]
+    }
+  },
+  "postCreateCommand": "./erlanglings list"
+}

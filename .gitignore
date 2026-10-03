@@ -1,14 +1,18 @@
-.eunit
-*.o
-*.beam
-*.plt
-erl_crash.dump
-.concrete/DEV_MODE
-.rebar
-rel/example_project
-ebin/*.beam
-deps
-.rebar3
+# build output from the erlanglings runner
 _build/
+
+# generic erlang
+*.beam
+*.dump
+erl_crash.dump
+.eunit
+.rebar3
 _checkouts/
 rebar3.crashdump
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
